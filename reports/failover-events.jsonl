@@ -1,0 +1,13 @@
+{"ts": 1791650582.3421683, "iso": "2026-10-10T16:43:02Z", "step": "1_verify_target", "region": "b", "state": {"region": "b", "pool_state": "warm", "weights": false, "count": 0, "latest_doc_ts": null, "ts": 1791650582.3414538}}
+{"ts": 1791650582.3448853, "iso": "2026-10-10T16:43:02Z", "step": "2_restore_snapshot", "region": "b", "snapshot_at": 1791650580.1279337, "rpo_seconds": 2.02, "docs_lost": 1, "embed_model_version": "embed-model=vi-e5-base@v3"}
+{"ts": 1791650582.3450913, "iso": "2026-10-10T16:43:02Z", "step": "3_scale_pool", "region": "b", "pool_state": "full"}
+{"ts": 1791650588.484601, "iso": "2026-10-10T16:43:08Z", "step": "4_wait_ready", "region": "b", "waited_s": 6.14, "vectors": {"count": 215, "latest_doc_ts": 1791650578.5067005}, "pool_state": "full"}
+{"ts": 1791650588.501012, "iso": "2026-10-10T16:43:08Z", "step": "5_dns_cutover", "region": "b", "active_region": "b"}
+{"ts": 1791650833.8527493, "iso": "2026-10-10T16:47:13Z", "step": "1_verify_target", "region": "b", "state": {"region": "b", "pool_state": "warm"}}
+{"ts": 1791650833.8527493, "iso": "2026-10-10T16:47:13Z", "step": "2_restore_snapshot", "region": "b", "snapshot_at": 1791650833.8527493, "rpo_seconds": 70.78, "docs_lost": 37, "embed_model_version": "test"}
+{"ts": 1791650833.8527493, "iso": "2026-10-10T16:47:13Z", "step": "3_scale_pool", "region": "b", "pool_state": "full"}
+{"ts": 1791650834.8580737, "iso": "2026-10-10T16:47:14Z", "step": "4_wait_ready", "region": "b", "ok": false, "waited_s": 1.0, "reason": "mocked: target khong bao gio ready"}
+{"ts": 1791650842.1563118, "iso": "2026-10-10T16:47:22Z", "step": "1_verify_target", "region": "b", "state": {"region": "b", "pool_state": "warm"}}
+{"ts": 1791650842.1579049, "iso": "2026-10-10T16:47:22Z", "step": "2_restore_snapshot", "region": "b", "snapshot_at": 1791650842.1568365, "rpo_seconds": 70.78, "docs_lost": 37, "embed_model_version": "test"}
+{"ts": 1791650842.1584399, "iso": "2026-10-10T16:47:22Z", "step": "3_scale_pool", "region": "b", "pool_state": "full"}
+{"ts": 1791650843.1598806, "iso": "2026-10-10T16:47:23Z", "step": "4_wait_ready", "region": "b", "ok": false, "waited_s": 1.0, "reason": "mocked: target khong bao gio ready"}

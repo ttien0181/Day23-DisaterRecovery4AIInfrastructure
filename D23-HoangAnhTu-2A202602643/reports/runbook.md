@@ -1,0 +1,15 @@
+# Runbook: Region A không phục vụ được inference
+
+Chạy từ thư mục gốc của lab trong cùng môi trường Linux với ba dịch vụ. Region A là primary, Region B là target. Phải có snapshot trong `state/_replica/` trước khi chuyển vùng. Mọi yêu cầu đi qua Edge ở cổng 8080. Người trực vận hành xác nhận trước khi chạy failover; không dùng `--auto` khi xử lý sự cố thật.
+
+| # | Bước và lệnh có thể chạy | Biết đã xong khi | Người phụ trách | Nếu không đạt |
+|---|---|---|---|---|
+| 1 | Xác nhận outage: `for i in 1 2 3; do python3 chaos/kill_region.py status; sleep 5; done` | A không trả `/healthz` trong ba lần; B vẫn `alive=true`. | On-call | Nếu A hồi phục hoặc B cũng chết, dừng và điều tra. |
+| 2 | Mở incident và chạy quy trình: `python3 dr/runbook.py --primary a --target b --backend fs` rồi nhập `y` sau khi kiểm tra. | `reports/runbook-run.jsonl` có `thong_bao_incident` với `outage_ts` và `notification_delay_s`. | On-call, xác nhận bởi incident commander | Nếu chưa được xác nhận, nhập `N`; chưa đổi hướng traffic. |
+| 3 | Theo dõi restore và scale: `tail -n 5 reports/failover-events.jsonl` | Có `1_verify_target`, `2_restore_snapshot`, `3_scale_pool`; sự kiện restore ghi `rpo_seconds`, `docs_lost`, `embed_model_version`. | DR operator | Nếu thiếu snapshot hoặc sai model version, dừng trước cutover. |
+| 4 | Kiểm tra B: `python3 -c "import httpx; print(httpx.get('http://127.0.0.1:8002/readyz').json())"` | `ready=true`, pool `full`, weights có và vector count lớn hơn 0. | DR operator | Nếu B chưa ready trong 60 giây, failover trả `ok=false` và không đổi `edge/active_region`. |
+| 5 | Kiểm tra cutover: `python3 -c "import httpx; print(httpx.get('http://127.0.0.1:8080/edge/state').json())"` | Sau tối đa 5 giây cache, `active_region=b`; log có `5_dns_cutover`. | On-call | Nếu Edge còn chỉ A, giữ incident mở và kiểm tra log; không ghi file bằng tay trước khi B ready. |
+| 6 | Kiểm tra tín hiệu phục vụ: `tail -n 2 reports/runbook-run.jsonl` | `verify_golden_signals` ghi 10/10 request thành công, `error_rate=0`, `p95_latency_ms<2500`. | On-call | Nếu còn lỗi, incident commander quyết định giữ B hay rollback sau khi xác nhận A đã ready. |
+| 7 | Đo và kết thúc: `python3 tools/measure_rto.py --loadgen reports/drill-2-withdr.jsonl --target-rto 300` | `valid=true`, không có warnings, `rto_verdict=PASS`; ghi kết quả vào postmortem. | Incident commander | Nếu số đo không hợp lệ, giữ incident mở và điều tra log trước khi tuyên bố phục hồi. |
+
+Quy trình ở bước 2 gọi `failover()` đúng một lần. Các bước 3 đến 6 chỉ đọc lại trạng thái và log, không chạy lại failover. Chỉ incident commander được duyệt rollback về A. Trước khi rollback, on-call phải kiểm tra `/readyz` của A trả 200 trong ba lần cách nhau 5 giây và xác nhận dữ liệu A còn phù hợp. Sau khi được duyệt, chạy `python3 -c "from pathlib import Path; Path('edge/active_region').write_text('a', encoding='utf-8')"`, chờ Edge hết TTL 5 giây, rồi gửi 10 request qua Edge và ghi lại kết quả. Không rollback tự động khi A vừa xuất hiện lại, vì hai vùng có thể đổi qua lại liên tục.

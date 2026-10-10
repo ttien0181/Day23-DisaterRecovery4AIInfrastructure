@@ -1,0 +1,477 @@
+Tổng quan bài lab
+Mục tiêu: Xây dựng hệ thống DR (Disaster Recovery) để hệ thống AI không bị "chết" khi một region bị sập. Bạn sẽ đo được thời gian phục hồi thực tế từ logs.
+
+Hệ thống mô phỏng
+Lab này mô phỏng 2 region (Data Center) chạy trên máy tính của bạn:
+
+Component	Mô phỏng	Port
+Region A	Inference API + Vector DB	8001
+Region B	Inference API + Vector DB	8002
+Edge Proxy	DNS/Load Balancer	8080
+Replication	Backup định kỳ	state/_replica/
+Hai chỉ số quan trọng
+RTO (Recovery Time Objective): Thời gian từ lúc outage đến khi hệ thống phục hồi. Mục tiêu: ≤ 300 giây.
+
+RPO (Recovery Point Objective): Dữ liệu bị mất bao lâu. Đo bằng số documents bị mất khi restore.
+
+
+
+
+Chuẩn bị môi trường
+Mục tiêu: Cài đặt và bật hệ thống lên thành công.
+
+⚠️ Lưu ý quan trọng cho Windows
+Nếu bạn gặp lỗi khi chạy lab trên Windows, đây là các vấn đề thường gặp và cách khắc phục:
+
+Lỗi	Nguyên nhân	Cách sửa
+make : The term 'make' is not recognized	Windows không có make sẵn	Xem phần "Cách chạy trên Windows" bên dưới
+wsl: Unknown key 'network.generateResolvConf'	File .wslconfig bị lỗi syntax	Mở C:\Users\ADMIN\.wslconfig và xóa dòng network.generateResolvConf
+curl : The URI prefix is not recognized	PowerShell có curl là alias của Invoke-WebRequest	Dùng curl.exe thay vì curl
+"active_region":"ï»¿a" (có ký tự lạ)	PowerShell Out-File -Encoding utf8 thêm BOM vào file	Dùng Python hoặc cmd (xem bên dưới)
+can't open file 'C:\\...\\Documents\\...'	Start-Job chạy trong thư mục sai	KHÔNG dùng Start-Job. Mở terminal MỚI cho mỗi process
+Chaos không kill được Region	Chaos script cần file run/region-a.pid	Dùng bash scripts/up_bare.sh thay vì chạy uvicorn trực tiếp
+Cách tạo file active_region không có BOM
+⚠️ Lỗi này xảy ra khi dùng PowerShell thông thường:
+
+# ❌ CÁCH SAI - Tạo file có BOM
+"a" | Out-File -FilePath edge/active_region -Encoding utf8
+# Kết quả: "ï»¿a" thay vì "a"
+Chép
+✅ CÁCH ĐÚNG - Không có BOM:
+
+# Cách 1: Dùng UTF8WithoutBOM
+"a" | Out-File -FilePath edge/active_region -Encoding utf8 -NoNewline
+
+# Cách 2: Dùng cmd (nhanh nhất)
+cmd /c "echo a > edge\active_region"
+
+# Cách 3: Dùng Python
+python -c "open('edge/active_region','w',encoding='utf-8').write('a')"
+Chép
+Sau khi tạo file đúng cách, kiểm tra lại:
+
+# Xóa file cũ
+Remove-Item edge/active_region
+
+# Tạo lại file đúng cách
+python -c "open('edge/active_region','w',encoding='utf-8').write('a')"
+
+# Kiểm tra
+curl.exe localhost:8080/edge/state
+# Kết quả đúng: {"active_region":"a",...}
+Chép
+Cách chạy trên Windows
+Thay vì dùng make, chạy các lệnh riêng:
+
+# 1. Seed Region A (200 docs + weights)
+python state/seed_vectors.py --region a --docs 200
+
+# 2. Seed Region B (rỗng)
+python state/seed_vectors.py --region b --docs 0 --weights-mb 0
+
+# 3. Tạo file active_region (DÙNG PYTHON - tránh BOM!)
+python -c "open('edge/active_region','w',encoding='utf-8').write('a')"
+Chép
+Bật services trên Windows
+Có 2 cách:
+
+Cách 1: Dùng bash script (nếu WSL hoạt động)
+
+bash scripts/up_bare.sh
+Chép
+Cách 2: Mở 3 terminal riêng
+
+# Terminal 1: Region A
+python -m uvicorn serving.app:app --host 127.0.0.1 --port 8001 --log-level warning
+
+# Terminal 2: Region B
+python -m uvicorn serving.app:app --host 127.0.0.1 --port 8002 --log-level warning
+
+# Terminal 3: Edge Proxy
+python -m uvicorn edge.proxy:app --host 127.0.0.1 --port 8080 --log-level warning
+Chép
+Kiểm tra services
+⚠️ Quan trọng: Dùng curl.exe thay vì curl trong PowerShell!
+
+# Kiểm tra Region A
+curl.exe localhost:8001/healthz
+
+# Kiểm tra Region B
+curl.exe localhost:8002/healthz
+
+# Kiểm tra Edge Proxy
+curl.exe localhost:8080/edge/state
+Chép
+Kết quả mong đợi:
+
+Region A: {"alive": true, "region": "a"}
+Region B: {"alive": true, "region": "b"}
+Edge: {"active_region": "a"}
+Test inference
+curl.exe "localhost:8080/v1/infer?q=hoa%20don%20thang%207"
+Chép
+Checkpoint: Phải thấy {"edge_region":"a", "answer":"[a] ..."} — inference đi qua Region A thành công.
+
+
+
+
+
+
+Khám phá hệ thống
+Mục tiêu: Hiểu luồng request và trả lời 3 câu hỏi quan trọng.
+
+Luồng request đi như thế nào?
+Request từ user đi qua 3 lớp:
+
+1. Edge Proxy (port 8080) — đọc file edge/active_region để biết đi đến region nào. Cache kết quả trong 5 giây (EDGE_TTL_SECONDS).
+1. Region API (port 8001/8002) — nhận request, kiểm tra 3 điều kiện trước khi serve:
+Pool state phải là "full" (không phải "cold" hay "warm")
+Model weights phải tồn tại (file weights/model.bin)
+Vector DB phải có dữ liệu (count > 0)
+1. Vector DB (SQLite) — lưu documents và timestamps.
+Kiểm tra Region B
+Region B bắt đầu rỗng — đây là thiết kế có chủ đích:
+
+curl.exe localhost:8002/v1/state
+Chép
+Kết quả mong đợi: {"count": 0, "weights": false, ...} — Region B không thể serve được ngay.
+
+Trả lời 3 câu hỏi trước khi viết code
+1. Nếu Region A chết ngay bây giờ, cái gì phát hiện?
+Đáp án: Không có gì — chưa có health checker.
+1. Region B có dữ liệu không?
+Đáp án: Không — count: 0, weights: false.
+1. Nếu đổi edge/active_region sang "b" ngay, user thấy gì?
+Đáp án: region_not_ready — vì Region B chưa có data.
+Checkpoint: Nếu bạn trả lời đúng cả 3 câu, bạn hiểu nguyên tắc cốt lõi: "Process sống ≠ Region có thể serve được".
+
+
+
+
+
+
+
+Baseline: Tấn công không có DR
+Mục tiêu: Chứng minh hệ thống sẽ thất bại hoàn toàn nếu không có DR.
+
+Chạy baseline drill
+⚠️ Quan trọng: Mở terminal MỚI cho mỗi background process!
+
+Start-Job chạy trong thư mục khác (Documents) → lỗi "No such file or directory".
+
+Terminal 1 - Traffic Generator
+# Mở PowerShell mới (Ctrl+Shift+T hoặc click chuột phải vào icon Terminal > New Tab)
+# Di chuyển đến thư mục lab của bạn
+cd <đường-dẫn-đến-thư-mục-lab>
+
+# Chạy traffic generator
+python loadgen/traffic.py --duration 40 --rps 2 --out reports/drill-1-nodr.jsonl
+Chép
+Terminal 2 - Kill Region
+# Mở PowerShell mới
+cd <đường-dẫn-đến-thư-mục-lab>
+
+# Đợi 8 giây cho traffic ổn định
+Start-Sleep -Seconds 8
+
+# Giết Region A
+python chaos/kill_region.py --region a --mode netblock --mock
+Chép
+Terminal 3 - Đo RTO
+# Mở PowerShell mới (sau khi Terminal 1 xong)
+cd <đường-dẫn-đến-thư-mục-lab>
+
+# Đo RTO
+python tools/measure_rto.py --loadgen reports/drill-1-nodr.jsonl --target-rto 300
+Chép
+Lưu ý: Thay <đường-dẫn-đến-thư-mục-lab> bằng đường dẫn thực tế của bạn (ví dụ: C:\Users\TenMay\Desktop\Day23-DisaterRecovery4AIInfrastructure)
+Kết quả mong đợi
+{
+  "rto_verdict": "NO_RECOVERY",
+  "requests_failed": 16,
+  "requests_total": 32
+}
+Chép
+User thấy lỗi từ ~+0.2s và không bao giờ hết lỗi.
+Không có health checker, không có failover → hệ thống chết hoàn toàn.
+Khôi phục Region A
+Trước khi tiếp tục, khôi phục Region A:
+
+python chaos/kill_region.py restore --region a --backend bare
+Chép
+Checkpoint: Sau khi restore, curl.exe localhost:8001/healthz phải trả {"alive": true}.
+
+
+
+
+
+
+
+Implement Health Checker
+Mục tiêu: Viết dr/health_checker.py để tự động phát hiện khi Region A down.
+
+Tại sao cần threshold?
+Một lần fail có thể do network lag tạm thời, không phải outage thật. Threshold yêu cầu N lần fail liên tiếp trước khi đổi trạng thái. Điều này chống flapping — tình trạng failover qua lại liên tục.
+
+Nguyên lý hoạt động
+Mỗi 5 giây:
+  Health Checker ──► GET /readyz Region A
+                    GET /readyz Region B
+
+  Probe 1: fail ────────────► Đợi
+  Probe 2: fail ────────────► Đợi
+  Probe 3: fail ────────────► Đổi sang UNHEALTHY
+Chép
+Detect floor = interval × threshold = 5s × 3 = 15 giây. Đây là thời gian tối thiểu để phát hiện outage.
+
+Code cần viết
+Mở file dr/health_checker.py và implement 2 functions:
+
+def probe(region: str, timeout: float) -> tuple[bool, str]:
+    """Kiểm tra /readyz của một region.
+
+    Trả về (ready, reason):
+    - ready=True nếu status_code == 200
+    - ready=False nếu timeout hoặc status != 200
+    """
+    # TODO: dùng httpx.get với timeout
+    # TODO: trả về (True/False, reason)
+    raise NotImplementedError
+Chép
+def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
+    """Vòng lặp poll + phát hiện transition + ghi JSONL.
+
+    Mỗi lần trạng thái thay đổi (HEALTHY <-> UNHEALTHY):
+    - Ghi 1 dòng JSONL có: ts, region, to, reason, interval_s, threshold
+    - Không ghi mỗi lần poll (log sẽ ngập)
+    """
+    # TODO: vòng lặp while còn trong duration
+    # TODO: đếm consecutive fails
+    # TODO: đổi trạng thái khi đủ threshold
+    # TODO: ghi JSONL khi state thay đổi
+    raise NotImplementedError
+Chép
+Kiểm tra
+pytest tests/test_failover.py::test_health_checker_can_threshold_lien_tiep -v
+Chép
+Checkpoint: Test phải PASS — nghĩa là một lần fail không đổi trạng thái, cần ≥3 lần fail liên tiếp.
+
+
+
+
+
+Implement Failover Script
+Mục tiêu: Viết dr/failover.py để tự động chuyển traffic sang Region B khi Region A down.
+
+5 bước failover — THỨ TỰ TUYỆT ĐỐI!
+Bước 1: verify_target — Kiểm tra Region B có tồn tại không.
+
+Bước 2: restore_snapshot — Copy dữ liệu từ backup vào Region B. Log bắt buộc: rpo_seconds, docs_lost, embed_model_version.
+
+Bước 3: scale_pool — Đổi pool_state từ "warm" sang "full" để bật GPU pool.
+
+Bước 4: wait_ready — QUAN TRỌNG NHẤT! Chờ Region B thực sự ready qua /readyz. Nếu timeout → ABORT, không cutover!
+
+Bước 5: dns_cutover — Chỉ sau khi Region B ready, ghi "b" vào edge/active_region.
+
+Tại sao thứ tự quan trọng?
+Nếu cutover TRƯỚC khi Region B ready:
+
+User ──► Edge ──► Region A (DEAD) ──► ❌ Lỗi
+              └─► Region B (NOT READY) ──► ❌ 503
+
+→ Lỗi từ CẢ HAI phía → RTO DÀI HƠN!
+Chép
+Code cần viết
+Mở file dr/failover.py và implement:
+
+def failover(target: str, backend: str, wait: float) -> dict:
+    """5 bước failover theo đúng thứ tự.
+
+    Trả về dict có:
+    - ok: True/False
+    - rpo_seconds, docs_lost (từ restore_snapshot)
+    - Các bước đã hoàn thành
+    """
+    # Bước 1: verify_target
+    # Bước 2: restore_snapshot (dùng snapshot.get)
+    # Bước 3: scale_pool (ghi "full" vào state/region-{target}/pool_state)
+    # Bước 4: wait_ready (poll /readyz với timeout = wait)
+    # Bước 5: dns_cutover (ghi target vào edge/active_region)
+
+    # ⚠️ NẾU BƯỚC 4 TIMEOUT: return ok=False, KHÔNG cutover!
+    raise NotImplementedError
+Chép
+Mỗi bước ghi 1 dòng vào reports/failover-events.jsonl với ts và step.
+
+Kiểm tra
+pytest tests/test_failover.py::test_failover_khong_cutover_khi_target_chua_ready -v
+Chép
+Checkpoint: Test phải PASS — nghĩa là nếu Region B không ready, script không được đổi active_region.
+
+
+
+
+
+
+Implement Runbook Automation
+Mục tiêu: Viết dr/runbook.py để tự động hóa 7 bước incident response.
+
+Tại sao BÁN tự động?
+Full-auto failover có thể gây flapping — 2 region đổi qua lại liên tục nếu có transient failure. Bán tự động = alert + confirm trước khi failover. Flag --auto chỉ dùng trong CI/grading.
+
+7 bước trong runbook
+#	Bước	Mô tả
+1	xac_nhan_outage	Probe cả 2 region, đừng tin 1 lần fail
+2	thong_bao_incident	Ghi timestamp bắt đầu đo RTO
+3	scale_gpu_pool	Gọi failover() MỘT LẦN DUY NHẤT
+4	verify_state_replica	Đọc kết quả từ bước 3, không gọi lại
+5	dns_cutover	Kiểm tra cutover thành công
+6	verify_golden_signals	10 request thật, kiểm tra latency
+7	post_incident	Log kết quả cuối cùng
+Code cần viết
+def confirm(auto: bool, msg: str) -> bool:
+    """Hỏi confirm nếu auto=False, tự động True nếu auto=True."""
+    if auto:
+        return True
+    # TODO: print msg và hỏi y/N
+    raise NotImplementedError
+Chép
+def run(primary: str, target: str, backend: str, auto: bool) -> dict:
+    """7 bước runbook."""
+    # TODO: implement 7 bước
+    # TODO: ghi log vào reports/runbook-run.jsonl
+    raise NotImplementedError
+
+
+
+
+
+
+
+
+Chạy Drill 2: Đo RTO với DR
+Mục tiêu: Chứng minh DR hoạt động và RTO ≤ 300 giây.
+
+Chuẩn bị replication
+Trước khi failover, phải có snapshot để restore:
+
+Mở 5 terminal riêng (mỗi terminal chạy 1 process):
+
+Terminal 1 - Ingest
+cd <đường-dẫn-đến-thư-mục-lab>
+python state/ingest.py --region a --rate 0.5 --duration 150
+Chép
+Terminal 2 - Replicate
+cd <đường-dẫn-đến-thư-mục-lab>
+python state/replicate.py --every 30 --duration 150 --backend fs
+Chép
+Terminal 3 - Traffic
+cd <đường-dẫn-đến-thư-mục-lab>
+Start-Sleep -Seconds 5
+python loadgen/traffic.py --duration 100 --rps 2 --out reports/drill-2-withdr.jsonl
+Chép
+Terminal 4 - Health Checker
+cd <đường-dẫn-đến-thư-mục-lab>
+python dr/health_checker.py --interval 5 --threshold 3 --duration 100 --out reports/health-events.jsonl
+Chép
+Terminal 5 - Kill & Runbook
+cd <đường-dẫn-đến-thư-mục-lab>
+Start-Sleep -Seconds 12
+python chaos/kill_region.py --region a --mode netblock --mock
+python dr/runbook.py --primary a --target b --backend fs --auto
+Chép
+Đo RTO (sau khi Terminal 3 xong)
+cd <đường-dẫn-đến-thư-mục-lab>
+python tools/measure_rto.py --loadgen reports/drill-2-withdr.jsonl --target-rto 300
+Chép
+Lưu ý: Thay <đường-dẫn-đến-thư-mục-lab> bằng đường dẫn thực tế của bạn
+Kết quả mong đợi
+{
+  "valid": true,
+  "rto_measured_s": 28.5,
+  "rto_verdict": "PASS",
+  "rpo_at_restore_s": 14.04,
+  "docs_lost": 7
+}
+Chép
+RTO Breakdown
+Mốc	+giây từ t_outage	Thành phần
+t_outage	0s	Chaos kill
+User thấy lỗi	+0.2s	Network timeout
+Health check phát hiện	+14.9s	Detect floor (5×3=15s)
+Snapshot restore xong	+17.2s	Copy files
+Region B ready	+23.3s	Pool warm-up 6s
+DNS cutover	+23.4s	Ghi file
+RTO	+28.5s	First success from B
+Checkpoint: RTO phải ≤ 300 giây để PASS.
+
+
+
+
+
+
+Hoàn thành Reports
+Mục tiêu: Điền 3 reports với số liệu thật từ logs.
+
+reports/rto-evidence.md
+Điền bảng evidence với số thật từ logs:
+
+| Mốc | +giây | Evidence |
+|---|---|---|
+| t_outage | 0 | chaos/chaos-events.jsonl:__ |
+| User thấy lỗi | +__s | reports/drill-2-withdr.jsonl:__ |
+| Health check phát hiện | +__s | reports/health-events.jsonl:__ |
+Chép
+Lưu ý: Mỗi Evidence phải là đường/file:số_dòng tồn tại thật. Không để placeholder.
+
+reports/runbook.md
+Điền template 1 trang để người khác có thể chạy failover lúc 3h sáng:
+
+#	Bước	Lệnh	Biết xong khi	Ai
+1	Xác nhận outage	python chaos/kill_region.py status	a.alive=false	on-call
+Mỗi bước cần: lệnh copy-paste được, signal hoàn thành, owner, và rollback condition.
+
+reports/postmortem.md
+Điền theo template blameless postmortem:
+
+Timeline với evidence path:line
+Gap analysis: RTO mục tiêu vs đo được
+Root cause: 5 whys (không phải "vì chạy chaos script")
+Action items có owner + deadline
+
+
+
+
+Nộp bài
+Cá nhân
+Tạo thư mục theo format:
+
+D23-HoVaTen-MSSV/
+├── dr/
+│   ├── health_checker.py
+│   ├── failover.py
+│   └── runbook.py
+└── reports/
+    ├── rto-evidence.md
+    ├── runbook.md
+    └── postmortem.md
+Chép
+Kiểm tra cuối cùng
+python -m pytest tests/ -v
+Chép
+Tất cả tests phải PASS trước khi nộp.
+
+Checklist hoàn thành
+dr/health_checker.py — pass test threshold
+dr/failover.py — pass test no premature cutover
+dr/runbook.py — 7 bước implement đúng
+reports/rto-evidence.md — số thật, có evidence path:line
+reports/runbook.md — đầy đủ 7 bước
+reports/postmortem.md — có gap analysis
+RTO ≤ 300 giây (drill 2)
+pytest tests/ -v — all pass
+
+
+
+
